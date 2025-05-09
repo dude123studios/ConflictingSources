@@ -1,51 +1,72 @@
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import  AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification, pipeline, AutoModel
 import torch
 import torch.nn.functional as F
 
 # --- Config ---
 SMALL_MODEL_NAME = "nreimers/MiniLM-L6-H384-uncased"
-LARGE_MODEL_NAME = "roberta-large-mnli"  # Example of open LLM that outputs logits
+LARGE_MODEL_NAME = "gpt2"  # Replace with API access if using GPT-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TOP_K_DOCS = 5  # or all
 
 # --- Load Models ---
 small_tokenizer = AutoTokenizer.from_pretrained(SMALL_MODEL_NAME)
 small_model = AutoModelForSequenceClassification.from_pretrained(SMALL_MODEL_NAME).to(DEVICE)
-
 large_tokenizer = AutoTokenizer.from_pretrained(LARGE_MODEL_NAME)
-large_model = AutoModelForSequenceClassification.from_pretrained(LARGE_MODEL_NAME).to(DEVICE)
+large_model = AutoModel.from_pretrained(LARGE_MODEL_NAME).to(DEVICE)
 
-# --- Core Functions ---
+# --- Helper Functions ---
 
 def get_logits(model, tokenizer, text):
     inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(DEVICE)
     with torch.no_grad():
         outputs = model(**inputs)
-    return outputs.logits.squeeze()  # shape: (num_classes)
+    return outputs.logits.squeeze()
 
 def compute_deltas(question, docs):
+    """For each doc, get delta = f(Q + D) - f(Q)"""
     base_logits = get_logits(small_model, small_tokenizer, question)
     deltas = []
-    for doc in docs:
-        input_text = question + "\n\n" + doc
-        logits_with_doc = get_logits(small_model, small_tokenizer, input_text)
-        delta = logits_with_doc - base_logits
+    for doc in docs[:TOP_K_DOCS]:
+        qd = question + "\n\n" + doc
+        logits = get_logits(small_model, small_tokenizer, qd)
+        delta = logits - base_logits
         deltas.append(delta)
+        print(delta)
     return torch.stack(deltas)
 
 def aggregate_deltas(deltas):
     return deltas.mean(dim=0)
 
-def fused_logits(question, aggregated_delta):
-    base_logits_large = get_logits(large_model, large_tokenizer, question)
-    final_logits = base_logits_large + aggregated_delta
-    return final_logits
+def delta_to_text(delta, label_names=None):
+    probs = F.softmax(delta, dim=-1)
+    if label_names:
+        sorted_probs = sorted(zip(label_names, probs.tolist()), key=lambda x: -x[1])
+        return "\n".join([f"{label}: {prob:.3f}" for label, prob in sorted_probs])
+    else:
+        return "Delta logits: " + ", ".join([f"{x:.3f}" for x in probs.tolist()])
 
-def predict_answer(logits, label_names):
-    probs = F.softmax(logits, dim=-1)
-    pred_idx = torch.argmax(probs).item()
-    return label_names[pred_idx], probs.tolist()
+LARGE_MODEL_NAME = "gpt2"  # or another LM that supports .generate
+large_tokenizer = AutoTokenizer.from_pretrained(LARGE_MODEL_NAME)
+large_model = AutoModelForCausalLM.from_pretrained(LARGE_MODEL_NAME).to(DEVICE)
+def prompt_large_model(question, delta_text):
+    prompt = f"""You are given the following question:
 
-# --- Example Run ---
+{question}
+
+Some small models have read documents and updated their belief on the answer. Here is their aggregated belief shift:
+
+{delta_text}
+
+Based on this, what is the best answer to the question?"""
+    
+    inputs = large_tokenizer(prompt, return_tensors="pt", truncation=True).to(DEVICE)
+    with torch.no_grad():
+        outputs = large_model.generate(
+            inputs["input_ids"], max_length=256, num_return_sequences=1
+        )
+    return large_tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# --- Example Usage ---
 
 question = "Is coffee good for your health?"
 documents = [
@@ -55,14 +76,12 @@ documents = [
     "Some doctors recommend limiting coffee intake to prevent high blood pressure.",
     "Many health experts agree that moderate coffee drinking is generally safe."
 ]
+label_names = ["No", "Yes"]  # Only if classification head supports this
 
-label_names = ["No", "Yes"]  # Adjust if model has more classes
-
+# Run Pipeline
 deltas = compute_deltas(question, documents)
 aggregated_delta = aggregate_deltas(deltas)
-final_logits = fused_logits(question, aggregated_delta)
+delta_text = delta_to_text(aggregated_delta, label_names=label_names)
+final_answer = prompt_large_model(question, delta_text)
 
-answer, probs = predict_answer(final_logits, label_names)
-
-print(f"Predicted Answer: {answer}")
-print("Probabilities:", {k: f"{v:.3f}" for k, v in zip(label_names, probs)})
+print("Final LLM Answer:\n", final_answer)
